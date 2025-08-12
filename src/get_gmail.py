@@ -17,6 +17,7 @@ from tqdm import tqdm
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 COLLECTION_NAME = "gmail_embeddings_full"
 HISTORY_FILE = "last_history_id.txt"
+BATCH_SIZE = 100  # Number of chunks to upload at once to avoid timeouts
 
 
 def gmail_authenticate():
@@ -127,9 +128,28 @@ def fetch_new_messages(service, max_results=50):
         message_ids = None
 
     if not message_ids:
-        print(f"Fetching latest {max_results} Gmail messages...")
-        results = service.users().messages().list(userId="me", maxResults=max_results).execute()
-        message_ids = [m["id"] for m in results.get("messages", [])]
+        print(f"Fetching latest {max_results} Gmail messages from Primary and Updates categories...")
+        # Fetch messages from Primary category
+        primary_results = (
+            service.users()
+            .messages()
+            .list(userId="me", maxResults=max_results, labelIds=["CATEGORY_PERSONAL"])
+            .execute()
+        )
+        primary_ids = [m["id"] for m in primary_results.get("messages", [])]
+
+        # Fetch messages from Updates category
+        updates_results = (
+            service.users()
+            .messages()
+            .list(userId="me", maxResults=max_results, labelIds=["CATEGORY_UPDATES"])
+            .execute()
+        )
+        updates_ids = [m["id"] for m in updates_results.get("messages", [])]
+
+        # Combine and deduplicate
+        message_ids = list(set(primary_ids + updates_ids))
+        print(f"Found {len(primary_ids)} Primary emails and {len(updates_ids)} Updates emails")
 
     # Save latest historyId for next run
     print("Fetching Gmail profile to get latest historyId...")
@@ -149,6 +169,26 @@ def get_email_details(service, msg_id):
     to = headers.get("To", "")
     date = headers.get("Date", "")
     thread_id = msg.get("threadId")
+
+    # Extract Gmail category from labels
+    category = "unknown"
+    if "labelIds" in msg:
+        for label in msg["labelIds"]:
+            if label == "CATEGORY_PERSONAL":
+                category = "Primary"
+                break
+            elif label == "CATEGORY_UPDATES":
+                category = "Updates"
+                break
+            elif label == "CATEGORY_SOCIAL":
+                category = "Social"
+                break
+            elif label == "CATEGORY_PROMOTIONS":
+                category = "Promotions"
+                break
+            elif label == "CATEGORY_FORUMS":
+                category = "Forums"
+                break
 
     body_text = ""
     attachments_text = []
@@ -227,6 +267,9 @@ def get_email_details(service, msg_id):
     if attachments_text:
         full_text += "\n\nAttachments:\n" + "\n".join(attachments_text)
 
+    # Create Gmail URL for the message
+    gmail_url = f"https://mail.google.com/mail/u/0/#inbox/{msg_id}"
+
     return {
         "id": msg_id,
         "thread_id": thread_id,
@@ -235,6 +278,8 @@ def get_email_details(service, msg_id):
         "to": to,
         "date": date,
         "text": full_text,
+        "url": gmail_url,
+        "category": category,
     }
 
 
@@ -244,7 +289,7 @@ def main():
     print("Building Gmail service...")
     service = build("gmail", "v1", credentials=creds)
 
-    message_ids = fetch_new_messages(service, max_results=50)
+    message_ids = fetch_new_messages(service, max_results=200)
     print(f"Found {len(message_ids)} new/updated messages.")
 
     print("Loading sentence transformer model...")
@@ -266,16 +311,55 @@ def main():
     point_id_counter = 0
     print("Processing emails and creating embeddings...")
     for idx, msg_id in enumerate(tqdm(message_ids)):
-        details = get_email_details(service, msg_id)
-        for chunk in chunk_text(details["text"], chunk_size=200):
-            vec = model.encode(chunk).tolist()
-            points.append(PointStruct(id=point_id_counter, vector=vec, payload=details))
-            point_id_counter += 1
+        try:
+            details = get_email_details(service, msg_id)
+            for chunk in chunk_text(details["text"], chunk_size=200):
+                vec = model.encode(chunk).tolist()
+                points.append(PointStruct(id=point_id_counter, vector=vec, payload=details))
+                point_id_counter += 1
+        except Exception as e:
+            print(f"Warning: Could not process email {msg_id}: {e}")
+            continue
+
+        # Progress update every 50 emails
+        if (idx + 1) % 50 == 0:
+            print(f"Processed {idx + 1}/{len(message_ids)} emails, created {len(points)} chunks so far...")
 
     if points:
-        print(f"Uploading {len(points)} chunks to Qdrant...")
-        qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
-        print(f"Successfully inserted {len(points)} chunks into Qdrant.")
+        print(f"Uploading {len(points)} chunks to Qdrant in batches...")
+
+        # Upload in smaller batches to avoid timeouts
+        batch_size = BATCH_SIZE
+        total_uploaded = 0
+
+        for i in range(0, len(points), batch_size):
+            batch = points[i : i + batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = (len(points) + batch_size - 1) // batch_size
+
+            print(f"Uploading batch {batch_num}/{total_batches} ({len(batch)} chunks)...")
+
+            try:
+                qdrant.upsert(collection_name=COLLECTION_NAME, points=batch)
+                total_uploaded += len(batch)
+                print(f"Successfully uploaded batch {batch_num}/{total_batches}")
+
+                # Small delay between batches to avoid overwhelming the server
+                if batch_num < total_batches:
+                    import time
+
+                    time.sleep(0.1)
+
+            except Exception as e:
+                print(f"Error uploading batch {batch_num}/{total_batches}: {e}")
+                print("Continuing with next batch...")
+                continue
+
+        print(f"Upload complete. Successfully inserted {total_uploaded}/{len(points)} chunks into Qdrant.")
+
+        # Clear points list to free memory
+        points.clear()
+        print("Memory cleared.")
     else:
         print("No new data to upload to Qdrant.")
 
